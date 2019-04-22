@@ -27,6 +27,25 @@
 #define ROT_PCMSK ((1 << PCINT3) | (1 << PCINT4))
 #define ROT_STEPS 20
 
+#define IR_TIMER_COMP (1 << COM0B1)
+#define IR_TIMER_TOP OCR0A
+#define IR_TIMER_DUTY_START OCR0B
+#define IR_TIMER_START do { \
+    TIMSK |= (1 << TOIE0); \
+    TCCR0A = (1 << WGM01) | (1 << WGM00); \
+    TCCR0B = (1 << WGM02) | (1 << CS00); \
+} while (false)
+#define IR_TIMER_CNT TCNT0
+#define IR_TIMER_STOP do { \
+    TIMSK &= ~(1 << TOIE0); \
+    TCCR0B &= ~(1 << CS00); \
+} while (false)
+#define IR_TIMER_PWM_ON TCCR0A |= ((1 << COM0B1) | (1 << COM0B0))
+#define IR_TIMER_PWM_OFF TCCR0A &= ~((1 << COM0B1) | (1 << COM0B0))
+#define IR_PORT PORTB
+#define IR_DDR DDRB
+#define IR_BIT (1 << PB1)
+
 static struct {
     volatile int8_t dir;
     volatile bool pressed;
@@ -163,6 +182,88 @@ static void powerdown(void) {
     debug_init();
 
     LOG("wakeup\n");
+}
+
+static struct {
+    volatile uint64_t data;
+    volatile uint8_t datalen;
+    volatile uint8_t pulsecount;
+    volatile uint8_t seqlen;
+} s_irtimer;
+
+ISR(TIMER0_COMPB_vect) {
+    if (s_irtimer.pulsecount == 0) {
+        if (s_irtimer.datalen == 0) {
+            IR_TIMER_STOP;
+            return;
+        }
+        --s_irtimer.datalen;
+        s_irtimer.pulsecount = s_irtimer.seqlen;
+        if ((s_irtimer.data & 1) != 0)
+            IR_TIMER_PWM_ON;
+        else
+            IR_TIMER_PWM_OFF;
+        s_irtimer.data >>= 1;
+    }
+    --s_irtimer.pulsecount;
+}
+
+static void start_pwm(uint16_t freq) {
+    uint8_t top = (F_CPU + freq) / ((uint32_t)freq * 2) - 1;
+    IR_TIMER_TOP = top;
+    IR_TIMER_DUTY_START = top - top / 4; // 1/4 duty cycle
+    IR_TIMER_CNT = 0;
+    IR_PORT &= ~IR_BIT; // set low
+    IR_DDR |= IR_BIT; // set to output
+    IR_TIMER_START;
+}
+
+static void ir_wait_for_finish(void) {
+    // wait for last data to finish
+    set_sleep_mode(SLEEP_MODE_IDLE);
+    cli();
+    while (s_irtimer.datalen > 0) {
+        sleep_enable();
+        sei();
+        sleep_cpu();
+        sleep_disable();
+        cli();
+    }
+    sei();
+}
+
+static void send_rc5(uint32_t data) {
+    // Each data bit represents one period of 32/36kHz.
+    // Transmit order is from LSB to MSB.
+
+    // RC5 command format:
+    // Each bit consists of two periods of 32/36kHz.
+    // 1: burst of 32 pulses, silence
+    // 0: silence, burst of 32 pulses
+    // two 1s, toggle bit, 5 adressbits
+
+    static bool toggle = false;
+    if (toggle) data ^= 0b110000;
+    toggle = !toggle;
+
+    ir_wait_for_finish();
+
+    s_irtimer.datalen = 14 * 2;
+    s_irtimer.seqlen = 32;
+    s_irtimer.data = data;
+
+    start_pwm(36000);
+}
+
+static void send_sony(uint64_t data) {
+    for (uint8_t i = 0; i < 3; ++i) {
+        ir_wait_for_finish();
+        // 600us, 45ms total
+        s_irtimer.datalen = 45000/600;
+        s_irtimer.seqlen = 24;
+        s_irtimer.data = data;
+        start_pwm(40000);
+    }
 }
 
 static void loop(void) {
